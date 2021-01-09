@@ -1,4 +1,5 @@
-/* Copyright (c) 2015, The Linux Foundation. All rights reserved.
+/* SPDX-License-Identifier: GPL-2.0-only */
+/* Copyright (c) 2015-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -30,11 +31,13 @@
 
 /* capabilities */
 #define CQHCI_CAP			0x04
+#define CQHCI_CAP_CS			(1 << 28)
 /* configuration */
 #define CQHCI_CFG			0x08
 #define CQHCI_DCMD			0x00001000
 #define CQHCI_TASK_DESC_SZ		0x00000100
 #define CQHCI_ENABLE			0x00000001
+#define CQHCI_ICE_ENABLE		0x00000002
 
 /* control */
 #define CQHCI_CTL			0x0C
@@ -47,8 +50,11 @@
 #define CQHCI_IS_TCC			BIT(1)
 #define CQHCI_IS_RED			BIT(2)
 #define CQHCI_IS_TCL			BIT(3)
+#define CQHCI_IS_GCE			BIT(4)
+#define CQHCI_IS_ICCE			BIT(5)
 
-#define CQHCI_IS_MASK (CQHCI_IS_TCC | CQHCI_IS_RED)
+#define CQHCI_IS_MASK (CQHCI_IS_TCC | CQHCI_IS_RED | \
+			CQHCI_IS_GCE | CQHCI_IS_ICCE)
 
 /* interrupt status enable */
 #define CQHCI_ISTE			0x14
@@ -92,11 +98,21 @@
 /* send status config 2 */
 #define CQHCI_SSC2			0x44
 
+/*
+ * Value n means CQE would send CMD13 during the transfer of data block
+ * BLOCK_CNT-n
+ */
+#define SEND_QSR_INTERVAL 0x70001
+
 /* response for dcmd */
 #define CQHCI_CRDCT			0x48
 
 /* response mode error mask */
 #define CQHCI_RMEM			0x50
+
+/* write protection violation */
+#define WP_ERASE_SKIP (1 << 15)
+#define WP_VIOLATION (1 << 26)
 
 /* task error info */
 #define CQHCI_TERRI			0x54
@@ -113,6 +129,14 @@
 
 /* command response argument */
 #define CQHCI_CRA			0x5C
+
+/*
+ * Add new macro for updated CQ vendor specific
+ * register address for SDHC v5.0 onwards.
+ */
+#define CQE_V5_VENDOR_CFG	0x900
+#define CQHCI_VENDOR_CFG   0x100
+#define CMDQ_SEND_STATUS_TRIGGER (1 << 31)
 
 #define CQHCI_INT_ALL			0xF
 #define CQHCI_IC_DEFAULT_ICCTH		31
@@ -145,6 +169,9 @@
 #define CQHCI_DAT_ADDR_LO(x)		(((x) & 0xFFFFFFFF) << 32)
 #define CQHCI_DAT_ADDR_HI(x)		(((x) & 0xFFFFFFFF) << 0)
 
+#define CQHCI_TASK_DESC_TASK_PARAMS_SIZE	8
+#define CQHCI_TASK_DESC_ICE_PARAMS_SIZE	8
+
 struct cqhci_host_ops;
 struct mmc_host;
 struct cqhci_slot;
@@ -167,6 +194,7 @@ struct cqhci_host {
 	u32 dcmd_slot;
 	u32 caps;
 #define CQHCI_TASK_DESC_SZ_128		0x1
+#define CQHCI_CAP_CRYPTO_SUPPORT	0x2
 
 	u32 quirks;
 #define CQHCI_QUIRK_SHORT_TXFR_DESC_SZ	0x1
@@ -177,6 +205,7 @@ struct cqhci_host {
 	bool activated;
 	bool waiting_for_idle;
 	bool recovery_halt;
+	bool offset_changed;
 
 	size_t desc_size;
 	size_t data_size;
@@ -210,11 +239,15 @@ struct cqhci_host_ops {
 	u32 (*read_l)(struct cqhci_host *host, int reg);
 	void (*enable)(struct mmc_host *mmc);
 	void (*disable)(struct mmc_host *mmc, bool recovery);
+	int (*crypto_cfg)(struct mmc_host *mmc, struct mmc_request *mrq,
+				u32 slot, u64 *ice_ctx);
+	int (*crypto_cfg_end)(struct mmc_host *mmc, struct mmc_request *mrq);
+	void (*crypto_cfg_reset)(struct mmc_host *mmc, unsigned int slot);
 };
 
 static inline void cqhci_writel(struct cqhci_host *host, u32 val, int reg)
 {
-	if (unlikely(host->ops->write_l))
+	if (unlikely(host->ops && host->ops->write_l))
 		host->ops->write_l(host, val, reg);
 	else
 		writel_relaxed(val, host->mmio + reg);
@@ -222,7 +255,7 @@ static inline void cqhci_writel(struct cqhci_host *host, u32 val, int reg)
 
 static inline u32 cqhci_readl(struct cqhci_host *host, int reg)
 {
-	if (unlikely(host->ops->read_l))
+	if (unlikely(host->ops && host->ops->read_l))
 		return host->ops->read_l(host, reg);
 	else
 		return readl_relaxed(host->mmio + reg);

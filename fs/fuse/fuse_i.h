@@ -27,6 +27,7 @@
 #include <linux/pid_namespace.h>
 #include <linux/refcount.h>
 #include <linux/user_namespace.h>
+#include <linux/freezer.h>
 
 /** Max number of pages that can be used in a single read request */
 #define FUSE_MAX_PAGES_PER_REQ 32
@@ -370,6 +371,9 @@ struct fuse_req {
 
 	/** Inode used in the request or NULL */
 	struct inode *inode;
+
+	/** Path used for completing d_canonical_path */
+	struct path *canonical_path;
 
 	/** AIO control block */
 	struct fuse_io_priv *io;
@@ -909,6 +913,8 @@ void fuse_ctl_remove_conn(struct fuse_conn *fc);
  */
 int fuse_valid_type(int m);
 
+bool fuse_invalid_attr(struct fuse_attr *attr);
+
 /**
  * Is current process allowed to perform filesystem operation?
  */
@@ -994,5 +1000,34 @@ extern const struct xattr_handler *fuse_no_acl_xattr_handlers[];
 struct posix_acl;
 struct posix_acl *fuse_get_acl(struct inode *inode, int type);
 int fuse_set_acl(struct inode *inode, struct posix_acl *acl, int type);
+
+#define fuse_wait_event(wq, condition)						\
+({										\
+	freezer_do_not_count();							\
+	wait_event(wq, condition);						\
+	freezer_count();							\
+})
+
+#define fuse_wait_event_killable(wq, condition)					\
+({										\
+	int __ret = 0;								\
+										\
+	freezer_do_not_count();							\
+	__ret = wait_event_killable(wq, condition);					\
+	freezer_count();							\
+										\
+	__ret;									\
+})
+
+#define fuse_wait_event_killable_exclusive(wq, condition)			\
+({										\
+	int __ret = 0;								\
+										\
+	freezer_do_not_count();							\
+	__ret = wait_event_killable_exclusive(wq, condition);				\
+	freezer_count();							\
+										\
+	__ret;									\
+})
 
 #endif /* _FS_FUSE_I_H */

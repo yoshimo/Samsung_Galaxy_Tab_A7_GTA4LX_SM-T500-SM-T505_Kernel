@@ -183,10 +183,95 @@ static struct attribute_group crash_note_cpu_attr_group = {
 };
 #endif
 
+#ifdef CONFIG_HOTPLUG_CPU
+
+static ssize_t isolate_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct cpu *cpu = container_of(dev, struct cpu, dev);
+	ssize_t rc;
+	int cpuid = cpu->dev.id;
+	unsigned int isolated = cpu_isolated(cpuid);
+
+	rc = snprintf(buf, PAGE_SIZE-2, "%d\n", isolated);
+
+	return rc;
+}
+
+static DEVICE_ATTR_RO(isolate);
+
+static struct attribute *cpu_isolated_attrs[] = {
+	&dev_attr_isolate.attr,
+	NULL
+};
+
+static struct attribute_group cpu_isolated_attr_group = {
+	.attrs = cpu_isolated_attrs,
+};
+
+#endif
+
+static ssize_t show_sched_load_boost(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	ssize_t rc;
+	unsigned int boost;
+	struct cpu *cpu = container_of(dev, struct cpu, dev);
+	int cpuid = cpu->dev.id;
+
+	boost = per_cpu(sched_load_boost, cpuid);
+	rc = snprintf(buf, PAGE_SIZE-2, "%d\n", boost);
+
+	return rc;
+}
+
+static ssize_t __ref store_sched_load_boost(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	int err;
+	int boost;
+	struct cpu *cpu = container_of(dev, struct cpu, dev);
+	int cpuid = cpu->dev.id;
+
+	err = kstrtoint(strstrip((char *)buf), 0, &boost);
+	if (err)
+		return err;
+
+	/*
+	 * -100 is low enough to cancel out CPU's load and make it near zro.
+	 * 1000 is close to the maximum value that cpu_util_freq_{walt,pelt}
+	 * can take without overflow.
+	 */
+	if (boost < -100 || boost > 1000)
+		return -EINVAL;
+
+	per_cpu(sched_load_boost, cpuid) = boost;
+
+	return count;
+}
+
+static DEVICE_ATTR(sched_load_boost, 0644,
+		   show_sched_load_boost,
+		   store_sched_load_boost);
+
+static struct attribute *sched_cpu_attrs[] = {
+	&dev_attr_sched_load_boost.attr,
+	NULL
+};
+
+static struct attribute_group sched_cpu_attr_group = {
+	.attrs = sched_cpu_attrs,
+};
+
 static const struct attribute_group *common_cpu_attr_groups[] = {
 #ifdef CONFIG_KEXEC
 	&crash_note_cpu_attr_group,
 #endif
+#ifdef CONFIG_HOTPLUG_CPU
+	&cpu_isolated_attr_group,
+#endif
+	&sched_cpu_attr_group,
 	NULL
 };
 
@@ -194,6 +279,10 @@ static const struct attribute_group *hotplugable_cpu_attr_groups[] = {
 #ifdef CONFIG_KEXEC
 	&crash_note_cpu_attr_group,
 #endif
+#ifdef CONFIG_HOTPLUG_CPU
+	&cpu_isolated_attr_group,
+#endif
+	&sched_cpu_attr_group,
 	NULL
 };
 
@@ -223,6 +312,7 @@ static struct cpu_attr cpu_attrs[] = {
 	_CPU_ATTR(online, &__cpu_online_mask),
 	_CPU_ATTR(possible, &__cpu_possible_mask),
 	_CPU_ATTR(present, &__cpu_present_mask),
+	_CPU_ATTR(core_ctl_isolated, &__cpu_isolated_mask),
 };
 
 /*
@@ -470,6 +560,7 @@ static struct attribute *cpu_root_attrs[] = {
 	&cpu_attrs[0].attr.attr,
 	&cpu_attrs[1].attr.attr,
 	&cpu_attrs[2].attr.attr,
+	&cpu_attrs[3].attr.attr,
 	&dev_attr_kernel_max.attr,
 	&dev_attr_offline.attr,
 	&dev_attr_isolated.attr,
@@ -552,12 +643,27 @@ ssize_t __weak cpu_show_mds(struct device *dev,
 	return sprintf(buf, "Not affected\n");
 }
 
+ssize_t __weak cpu_show_tsx_async_abort(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	return sprintf(buf, "Not affected\n");
+}
+
+ssize_t __weak cpu_show_itlb_multihit(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "Not affected\n");
+}
+
 static DEVICE_ATTR(meltdown, 0444, cpu_show_meltdown, NULL);
 static DEVICE_ATTR(spectre_v1, 0444, cpu_show_spectre_v1, NULL);
 static DEVICE_ATTR(spectre_v2, 0444, cpu_show_spectre_v2, NULL);
 static DEVICE_ATTR(spec_store_bypass, 0444, cpu_show_spec_store_bypass, NULL);
 static DEVICE_ATTR(l1tf, 0444, cpu_show_l1tf, NULL);
 static DEVICE_ATTR(mds, 0444, cpu_show_mds, NULL);
+static DEVICE_ATTR(tsx_async_abort, 0444, cpu_show_tsx_async_abort, NULL);
+static DEVICE_ATTR(itlb_multihit, 0444, cpu_show_itlb_multihit, NULL);
 
 static struct attribute *cpu_root_vulnerabilities_attrs[] = {
 	&dev_attr_meltdown.attr,
@@ -566,6 +672,8 @@ static struct attribute *cpu_root_vulnerabilities_attrs[] = {
 	&dev_attr_spec_store_bypass.attr,
 	&dev_attr_l1tf.attr,
 	&dev_attr_mds.attr,
+	&dev_attr_tsx_async_abort.attr,
+	&dev_attr_itlb_multihit.attr,
 	NULL
 };
 

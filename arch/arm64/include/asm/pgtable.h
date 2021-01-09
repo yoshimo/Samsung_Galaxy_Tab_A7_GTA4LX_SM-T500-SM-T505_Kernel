@@ -19,6 +19,7 @@
 #include <asm/bug.h>
 #include <asm/proc-fns.h>
 
+#include <asm/bug.h>
 #include <asm/memory.h>
 #include <asm/pgtable-hwdef.h>
 #include <asm/pgtable-prot.h>
@@ -105,12 +106,8 @@ extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
 #define pte_dirty(pte)		(pte_sw_dirty(pte) || pte_hw_dirty(pte))
 
 #define pte_valid(pte)		(!!(pte_val(pte) & PTE_VALID))
-/*
- * Execute-only user mappings do not have the PTE_USER bit set. All valid
- * kernel mappings have the PTE_UXN bit set.
- */
 #define pte_valid_not_user(pte) \
-	((pte_val(pte) & (PTE_VALID | PTE_USER | PTE_UXN)) == (PTE_VALID | PTE_UXN))
+	((pte_val(pte) & (PTE_VALID | PTE_USER)) == PTE_VALID)
 #define pte_valid_young(pte) \
 	((pte_val(pte) & (PTE_VALID | PTE_AF)) == (PTE_VALID | PTE_AF))
 #define pte_valid_user(pte) \
@@ -126,8 +123,8 @@ extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
 
 /*
  * p??_access_permitted() is true for valid user mappings (subject to the
- * write permission check) other than user execute-only which do not have the
- * PTE_USER bit set. PROT_NONE mappings do not have the PTE_VALID bit set.
+ * write permission check). PROT_NONE mappings do not have the PTE_VALID bit
+ * set.
  */
 #define pte_access_permitted(pte, write) \
 	(pte_valid_user(pte) && (!(write) || pte_write(pte)))
@@ -218,6 +215,34 @@ static inline pmd_t pmd_mkcont(pmd_t pmd)
 
 static inline void set_pte(pte_t *ptep, pte_t pte)
 {
+#ifdef CONFIG_ARM64_STRICT_BREAK_BEFORE_MAKE
+	pteval_t old = pte_val(*ptep);
+	pteval_t new = pte_val(pte);
+
+	/* Only problematic if valid -> valid */
+	if (!(old & new & PTE_VALID))
+		goto pte_ok;
+
+	/* Changing attributes should go via an invalid entry */
+	if (WARN_ON((old & PTE_ATTRINDX_MASK) != (new & PTE_ATTRINDX_MASK)))
+		goto pte_bad;
+
+	/* Change of OA is only an issue if one mapping is writable */
+	if (!(old & new & PTE_RDONLY) &&
+	    WARN_ON(pte_pfn(*ptep) != pte_pfn(pte)))
+		goto pte_bad;
+
+	goto pte_ok;
+
+pte_bad:
+	*ptep = __pte(0);
+	dsb(ishst);
+	asm("tlbi	vmalle1is");
+	dsb(ish);
+	isb();
+pte_ok:
+#endif
+
 	WRITE_ONCE(*ptep, pte);
 
 	/*
@@ -272,23 +297,6 @@ static inline void set_pte_at(struct mm_struct *mm, unsigned long addr,
 	}
 
 	set_pte(ptep, pte);
-}
-
-#define __HAVE_ARCH_PTE_SAME
-static inline int pte_same(pte_t pte_a, pte_t pte_b)
-{
-	pteval_t lhs, rhs;
-
-	lhs = pte_val(pte_a);
-	rhs = pte_val(pte_b);
-
-	if (pte_present(pte_a))
-		lhs &= ~PTE_RDONLY;
-
-	if (pte_present(pte_b))
-		rhs &= ~PTE_RDONLY;
-
-	return (lhs == rhs);
 }
 
 /*
@@ -447,6 +455,11 @@ static inline phys_addr_t pmd_page_paddr(pmd_t pmd)
 	return __pmd_to_phys(pmd);
 }
 
+static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+{
+	return (unsigned long) __va(pmd_page_paddr(pmd));
+}
+
 static inline void pte_unmap(pte_t *pte) { }
 
 /* Find an entry in the third-level page table. */
@@ -499,6 +512,11 @@ static inline phys_addr_t pud_page_paddr(pud_t pud)
 	return __pud_to_phys(pud);
 }
 
+static inline unsigned long pud_page_vaddr(pud_t pud)
+{
+	return (unsigned long) __va(pud_page_paddr(pud));
+}
+
 /* Find an entry in the second-level page table. */
 #define pmd_index(addr)		(((addr) >> PMD_SHIFT) & (PTRS_PER_PMD - 1))
 
@@ -549,6 +567,11 @@ static inline void pgd_clear(pgd_t *pgdp)
 static inline phys_addr_t pgd_page_paddr(pgd_t pgd)
 {
 	return __pgd_to_phys(pgd);
+}
+
+static inline unsigned long pgd_page_vaddr(pgd_t pgd)
+{
+	return (unsigned long) __va(pgd_page_paddr(pgd));
 }
 
 /* Find an entry in the frst-level page table. */
