@@ -40,7 +40,6 @@
 #include <linux/compat.h>
 #endif
 
-#define __FS_HAS_ENCRYPTION IS_ENABLED(CONFIG_EXT4_FS_ENCRYPTION)
 #include <linux/fscrypt.h>
 
 #include <linux/compiler.h>
@@ -151,6 +150,7 @@ enum SHIFT_DIRECTION {
 #define EXT4_MB_USE_ROOT_BLOCKS		0x1000
 /* Use blocks from reserved pool */
 #define EXT4_MB_USE_RESERVED		0x2000
+#define EXT4_MB_USE_EXTRA_ROOT_BLOCKS	0x4000
 
 struct ext4_allocation_request {
 	/* target inode for block we're allocating */
@@ -224,7 +224,10 @@ typedef struct ext4_io_end {
 	ssize_t			size;		/* size of the extent */
 } ext4_io_end_t;
 
+#define EXT4_IO_ENCRYPTED	1
+
 struct ext4_io_submit {
+	unsigned int		io_flags;
 	struct writeback_control *io_wbc;
 	struct bio		*io_bio;
 	ext4_io_end_t		*io_end;
@@ -417,10 +420,11 @@ struct flex_groups {
 #define EXT4_EOFBLOCKS_FL		0x00400000 /* Blocks allocated beyond EOF */
 #define EXT4_INLINE_DATA_FL		0x10000000 /* Inode has inline data. */
 #define EXT4_PROJINHERIT_FL		0x20000000 /* Create with parents projid */
+#define EXT4_CORE_FILE_FL		0x40000000
 #define EXT4_RESERVED_FL		0x80000000 /* reserved for ext4 lib */
 
-#define EXT4_FL_USER_VISIBLE		0x304BDFFF /* User visible flags */
-#define EXT4_FL_USER_MODIFIABLE		0x204BC0FF /* User modifiable flags */
+#define EXT4_FL_USER_VISIBLE		0x704BDFFF /* User visible flags */
+#define EXT4_FL_USER_MODIFIABLE		0x604BC0FF /* User modifiable flags */
 
 /* Flags we can manipulate with through EXT4_IOC_FSSETXATTR */
 #define EXT4_FL_XFLAG_VISIBLE		(EXT4_SYNC_FL | \
@@ -487,6 +491,7 @@ enum {
 	EXT4_INODE_EOFBLOCKS	= 22,	/* Blocks allocated beyond EOF */
 	EXT4_INODE_INLINE_DATA	= 28,	/* Data in inode. */
 	EXT4_INODE_PROJINHERIT	= 29,	/* Create with parents projid */
+	EXT4_INODE_CORE_FILE	= 30,
 	EXT4_INODE_RESERVED	= 31,	/* reserved for ext4 lib */
 };
 
@@ -532,6 +537,7 @@ static inline void ext4_check_flag_values(void)
 	CHECK_FLAG_VALUE(EOFBLOCKS);
 	CHECK_FLAG_VALUE(INLINE_DATA);
 	CHECK_FLAG_VALUE(PROJINHERIT);
+	CHECK_FLAG_VALUE(CORE_FILE);
 	CHECK_FLAG_VALUE(RESERVED);
 }
 
@@ -1293,6 +1299,7 @@ struct ext4_super_block {
 	__le64	s_kbytes_written;	/* nr of lifetime kilobytes written */
 	__le32	s_snapshot_inum;	/* Inode number of active snapshot */
 	__le32	s_snapshot_id;		/* sequential ID of active snapshot */
+#define ext4_sec_r_blocks_count(es)	(le64_to_cpu(es->s_snapshot_r_blocks_count))
 	__le64	s_snapshot_r_blocks_count; /* reserved blocks for active
 					      snapshot's future use */
 	__le32	s_snapshot_list;	/* inode number of the head of the
@@ -1342,7 +1349,7 @@ struct ext4_super_block {
 #define EXT4_MF_FS_ABORTED		0x0002	/* Fatal error detected */
 #define EXT4_MF_TEST_DUMMY_ENCRYPTION	0x0004
 
-#ifdef CONFIG_EXT4_FS_ENCRYPTION
+#ifdef CONFIG_FS_ENCRYPTION
 #define DUMMY_ENCRYPTION_ENABLED(sbi) (unlikely((sbi)->s_mount_flags & \
 						EXT4_MF_TEST_DUMMY_ENCRYPTION))
 #else
@@ -1428,6 +1435,9 @@ struct ext4_sb_info {
 	unsigned long s_ext_blocks;
 	unsigned long s_ext_extents;
 #endif
+
+	/* Reserved inodes count */
+	s64 s_r_inodes_count;
 
 	/* for buddy allocator */
 	struct ext4_group_info ***s_group_info;
@@ -1523,6 +1533,15 @@ struct ext4_sb_info {
 	/* Barrier between changing inodes' journal flags and writepages ops. */
 	struct percpu_rw_semaphore s_journal_flag_rwsem;
 	struct dax_device *s_daxdev;
+
+	/* @fs.sec -- 383cc825c9f7dcbcabf87132aa81f0d48fdbcaee -- */
+	/* To gather information of fragmentation */
+	unsigned int s_sec_part_best_extents;
+	unsigned int s_sec_part_current_extents;
+	unsigned int s_sec_part_score;
+	unsigned int s_sec_defrag_writes_kb;
+	unsigned int s_sec_num_apps;
+	unsigned int s_sec_capacity_apps_kb;
 };
 
 static inline struct ext4_sb_info *EXT4_SB(struct super_block *sb)
@@ -1894,6 +1913,11 @@ static inline int ext4_forced_shutdown(struct ext4_sb_info *sbi)
 #define EXT4_DEF_MAX_BATCH_TIME	15000 /* 15ms */
 
 /*
+ * Default reserved inode count
+ */
+#define EXT4_DEF_RESERVE_INODE 8192
+
+/*
  * Minimum number of groups in a flexgroup before we separate out
  * directories into the first block group of a flexgroup
  */
@@ -2072,7 +2096,7 @@ struct ext4_filename {
 	const struct qstr *usr_fname;
 	struct fscrypt_str disk_name;
 	struct dx_hash_info hinfo;
-#ifdef CONFIG_EXT4_FS_ENCRYPTION
+#ifdef CONFIG_FS_ENCRYPTION
 	struct fscrypt_str crypto_buf;
 #endif
 };
@@ -2300,29 +2324,48 @@ extern unsigned ext4_free_clusters_after_init(struct super_block *sb,
 					      struct ext4_group_desc *gdp);
 ext4_fsblk_t ext4_inode_to_goal_block(struct inode *);
 
-static inline bool ext4_encrypted_inode(struct inode *inode)
+#ifdef CONFIG_FS_ENCRYPTION
+static inline void ext4_fname_from_fscrypt_name(struct ext4_filename *dst,
+						const struct fscrypt_name *src)
 {
-	return ext4_test_inode_flag(inode, EXT4_INODE_ENCRYPT);
+	memset(dst, 0, sizeof(*dst));
+
+	dst->usr_fname = src->usr_fname;
+	dst->disk_name = src->disk_name;
+	dst->hinfo.hash = src->hash;
+	dst->hinfo.minor_hash = src->minor_hash;
+	dst->crypto_buf = src->crypto_buf;
 }
 
-#ifdef CONFIG_EXT4_FS_ENCRYPTION
 static inline int ext4_fname_setup_filename(struct inode *dir,
-			const struct qstr *iname,
-			int lookup, struct ext4_filename *fname)
+					    const struct qstr *iname,
+					    int lookup,
+					    struct ext4_filename *fname)
 {
 	struct fscrypt_name name;
 	int err;
 
-	memset(fname, 0, sizeof(struct ext4_filename));
-
 	err = fscrypt_setup_filename(dir, iname, lookup, &name);
+	if (err)
+		return err;
 
-	fname->usr_fname = name.usr_fname;
-	fname->disk_name = name.disk_name;
-	fname->hinfo.hash = name.hash;
-	fname->hinfo.minor_hash = name.minor_hash;
-	fname->crypto_buf = name.crypto_buf;
-	return err;
+	ext4_fname_from_fscrypt_name(fname, &name);
+	return 0;
+}
+
+static inline int ext4_fname_prepare_lookup(struct inode *dir,
+					    struct dentry *dentry,
+					    struct ext4_filename *fname)
+{
+	struct fscrypt_name name;
+	int err;
+
+	err = fscrypt_prepare_lookup(dir, dentry, &name);
+	if (err)
+		return err;
+
+	ext4_fname_from_fscrypt_name(fname, &name);
+	return 0;
 }
 
 static inline void ext4_fname_free_filename(struct ext4_filename *fname)
@@ -2336,19 +2379,27 @@ static inline void ext4_fname_free_filename(struct ext4_filename *fname)
 	fname->usr_fname = NULL;
 	fname->disk_name.name = NULL;
 }
-#else
+#else /* !CONFIG_FS_ENCRYPTION */
 static inline int ext4_fname_setup_filename(struct inode *dir,
-		const struct qstr *iname,
-		int lookup, struct ext4_filename *fname)
+					    const struct qstr *iname,
+					    int lookup,
+					    struct ext4_filename *fname)
 {
 	fname->usr_fname = iname;
 	fname->disk_name.name = (unsigned char *) iname->name;
 	fname->disk_name.len = iname->len;
 	return 0;
 }
-static inline void ext4_fname_free_filename(struct ext4_filename *fname) { }
 
-#endif
+static inline int ext4_fname_prepare_lookup(struct inode *dir,
+					    struct dentry *dentry,
+					    struct ext4_filename *fname)
+{
+	return ext4_fname_setup_filename(dir, &dentry->d_name, 1, fname);
+}
+
+static inline void ext4_fname_free_filename(struct ext4_filename *fname) { }
+#endif /* !CONFIG_FS_ENCRYPTION */
 
 /* dir.c */
 extern int __ext4_check_dir_entry(const char *, unsigned int, struct inode *,
@@ -2448,6 +2499,8 @@ extern int ext4_group_add_blocks(handle_t *handle, struct super_block *sb,
 				ext4_fsblk_t block, unsigned long count);
 extern int ext4_trim_fs(struct super_block *, struct fstrim_range *);
 extern void ext4_process_freed_data(struct super_block *sb, tid_t commit_tid);
+/* @fs.sec -- 6b923205333476fedd3982ba786a1dff129f0951 -- */
+extern ssize_t ext4_mb_freefrag_show(struct ext4_sb_info *sbi, char *buf);
 
 /* inode.c */
 int ext4_inode_is_fast_symlink(struct inode *inode);
@@ -2742,6 +2795,12 @@ static inline int ext4_has_metadata_csum(struct super_block *sb)
 	return ext4_has_feature_metadata_csum(sb) &&
 	       (EXT4_SB(sb)->s_chksum_driver != NULL);
 }
+
+extern void print_iloc_info(struct super_block *sb, struct ext4_iloc iloc);
+extern void print_bh(struct super_block *sb,
+		struct buffer_head *bh, int start, int len);
+extern void print_block_data(struct super_block *sb, sector_t blocknr,
+		unsigned char *data_to_dump, int start, int len);
 
 static inline int ext4_has_group_desc_csum(struct super_block *sb)
 {

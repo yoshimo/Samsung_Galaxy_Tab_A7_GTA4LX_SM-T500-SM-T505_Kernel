@@ -851,7 +851,7 @@ struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm)
 			if (unlikely(!memcg))
 				memcg = root_mem_cgroup;
 		}
-	} while (!css_tryget_online(&memcg->css));
+	} while (!css_tryget(&memcg->css));
 	rcu_read_unlock();
 	return memcg;
 }
@@ -2225,6 +2225,15 @@ retry:
 	}
 
 	/*
+	 * Memcg doesn't have a dedicated reserve for atomic
+	 * allocations. But like the global atomic pool, we need to
+	 * put the burden of reclaim on regular allocation requests
+	 * and let these go through as privileged allocations.
+	 */
+	if (gfp_mask & __GFP_ATOMIC)
+		goto force;
+
+	/*
 	 * Unlike in global OOM situations, memcg is not in a physical
 	 * memory shortage.  Allow dying and OOM-killed tasks to
 	 * bypass the last charges so that they can exit quickly and
@@ -2669,7 +2678,7 @@ int memcg_kmem_charge(struct page *page, gfp_t gfp, int order)
 	struct mem_cgroup *memcg;
 	int ret = 0;
 
-	if (memcg_kmem_bypass())
+	if (mem_cgroup_disabled() || memcg_kmem_bypass())
 		return 0;
 
 	memcg = get_mem_cgroup_from_current();
@@ -3527,6 +3536,18 @@ static int memcg_stat_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+static u64 mem_cgroup_vmpressure_read(struct cgroup_subsys_state *css,
+				      struct cftype *cft)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+	struct vmpressure *vmpr = memcg_to_vmpressure(memcg);
+	unsigned long vmpressure;
+
+	vmpressure = vmpr->pressure;
+
+	return vmpressure;
+}
+
 static u64 mem_cgroup_swappiness_read(struct cgroup_subsys_state *css,
 				      struct cftype *cft)
 {
@@ -4290,6 +4311,10 @@ static struct cftype mem_cgroup_legacy_files[] = {
 	},
 	{
 		.name = "pressure_level",
+	},
+	{
+		.name = "vmpressure",
+		.read_u64 = mem_cgroup_vmpressure_read,
 	},
 #ifdef CONFIG_NUMA
 	{

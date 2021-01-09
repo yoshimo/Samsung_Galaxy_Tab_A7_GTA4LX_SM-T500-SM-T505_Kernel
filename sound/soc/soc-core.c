@@ -51,6 +51,14 @@ EXPORT_SYMBOL_GPL(snd_soc_debugfs_root);
 #endif
 
 static DEFINE_MUTEX(client_mutex);
+//Bug 515704 baoshulin.wt 20191125 modify for compatiable smartpa
+static DEFINE_MUTEX(smartpa_mutex);
+int smartpa_type=INVALD;
+EXPORT_SYMBOL(smartpa_type);
+module_param(smartpa_type, int, 0664);
+MODULE_PARM_DESC(smartpa_type, "show smartpa type");
+//-Bug 515704 baoshulin.wt 20191125 modify for compatiable smartpa
+
 static LIST_HEAD(component_list);
 
 /*
@@ -154,7 +162,7 @@ static void soc_init_component_debugfs(struct snd_soc_component *component)
 	}
 
 	if (!component->debugfs_root) {
-		dev_warn(component->dev,
+		dev_dbg(component->dev,
 			"ASoC: Failed to create component debugfs directory\n");
 		return;
 	}
@@ -718,10 +726,26 @@ EXPORT_SYMBOL_GPL(snd_soc_resume);
 static const struct snd_soc_dai_ops null_dai_ops = {
 };
 
-static struct snd_soc_component *soc_find_component(
+/**
+ * soc_find_component: find a component from component_list in ASoC core
+ *
+ * @of_node: of_node of the component to query.
+ * @name: name of the component to query.
+ *
+ * function to find out if a component is already registered with ASoC core.
+ *
+ * Returns component handle for success, else NULL error.
+ */
+struct snd_soc_component *soc_find_component(
 	const struct device_node *of_node, const char *name)
 {
 	struct snd_soc_component *component;
+
+	if (!of_node && !name) {
+		pr_err("%s: Either of_node or name must be valid\n",
+			__func__);
+		return NULL;
+	}
 
 	lockdep_assert_held(&client_mutex);
 
@@ -736,6 +760,29 @@ static struct snd_soc_component *soc_find_component(
 
 	return NULL;
 }
+EXPORT_SYMBOL(soc_find_component);
+
+/**
+ * soc_find_component_locked: soc_find_component with client lock acquired
+ *
+ * @of_node: of_node of the component to query.
+ * @name: name of the component to query.
+ *
+ * function to find out if a component is already registered with ASoC core.
+ *
+ * Returns component handle for success, else NULL error.
+ */
+struct snd_soc_component *soc_find_component_locked(
+	const struct device_node *of_node, const char *name)
+{
+	struct snd_soc_component *component = NULL;
+
+	mutex_lock(&client_mutex);
+	component = soc_find_component(of_node, name);
+	mutex_unlock(&client_mutex);
+	return component;
+}
+EXPORT_SYMBOL(soc_find_component_locked);
 
 /**
  * snd_soc_find_dai - Find a registered DAI
@@ -2734,6 +2781,7 @@ int snd_soc_register_card(struct snd_soc_card *card)
 	card->instantiated = 0;
 	mutex_init(&card->mutex);
 	mutex_init(&card->dapm_mutex);
+	mutex_init(&card->dapm_power_mutex);
 
 	ret = snd_soc_instantiate_card(card);
 	if (ret != 0)
@@ -3052,6 +3100,36 @@ static void snd_soc_component_setup_regmap(struct snd_soc_component *component)
 
 #ifdef CONFIG_REGMAP
 
+//+Bug 515704 baoshulin.wt 20191125 modify for compatiable smartpa
+struct device *audio_device = NULL;
+int snd_soc_set_smartpa_type(const char * name, int pa_type)
+{
+	pr_info("%s driver set smartpa type is : %d",name,pa_type);
+	mutex_lock(&smartpa_mutex);
+	switch(pa_type)
+	{
+	case FS16XX:
+			smartpa_type=FS16XX;
+		break;
+	case FS18XX:
+			smartpa_type=FS18XX;
+		break;
+	case AW8825:
+			smartpa_type=AW8825;
+	    break;
+    case TAS2558:
+			smartpa_type=TAS2558;
+	    break;
+	default:
+			pr_info("this PA does not support\n\r");
+		break;
+	}
+	mutex_unlock(&smartpa_mutex);
+	return smartpa_type;
+}
+EXPORT_SYMBOL_GPL(snd_soc_set_smartpa_type);
+//-Bug 515704 baoshulin.wt 20191125 modify for compatiable smartpa
+
 /**
  * snd_soc_component_init_regmap() - Initialize regmap instance for the component
  * @component: The component for which to initialize the regmap instance
@@ -3271,6 +3349,18 @@ struct snd_soc_component *snd_soc_lookup_component(struct device *dev,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(snd_soc_lookup_component);
+
+/**
+ * snd_soc_card_change_online_state - Mark if soc card is online/offline
+ *
+ * @soc_card : soc_card to mark
+ */
+void snd_soc_card_change_online_state(struct snd_soc_card *soc_card, int online)
+{
+	if (soc_card && soc_card->snd_card)
+		snd_card_change_online_state(soc_card->snd_card, online);
+}
+EXPORT_SYMBOL(snd_soc_card_change_online_state);
 
 /* Retrieve a card's name from device tree */
 int snd_soc_of_parse_card_name(struct snd_soc_card *card,
@@ -3675,6 +3765,39 @@ int snd_soc_get_dai_id(struct device_node *ep)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(snd_soc_get_dai_id);
+
+/**
+ * snd_soc_info_multi_ext - external single mixer info callback
+ * @kcontrol: mixer control
+ * @uinfo: control element information
+ *
+ * Callback to provide information about a single external mixer control.
+ * that accepts multiple input.
+ *
+ * Returns 0 for success.
+ */
+int snd_soc_info_multi_ext(struct snd_kcontrol *kcontrol,
+	struct snd_ctl_elem_info *uinfo)
+{
+	struct soc_multi_mixer_control *mc =
+		(struct soc_multi_mixer_control *)kcontrol->private_value;
+	int platform_max;
+
+	if (!mc->platform_max)
+		mc->platform_max = mc->max;
+	platform_max = mc->platform_max;
+
+	if (platform_max == 1 && !strnstr(kcontrol->id.name, " Volume", 30))
+		uinfo->type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
+	else
+		uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+
+	uinfo->count = mc->count;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = platform_max;
+	return 0;
+}
+EXPORT_SYMBOL(snd_soc_info_multi_ext);
 
 int snd_soc_get_dai_name(struct of_phandle_args *args,
 				const char **dai_name)

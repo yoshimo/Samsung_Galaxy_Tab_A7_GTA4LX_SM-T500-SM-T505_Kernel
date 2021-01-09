@@ -648,11 +648,20 @@ struct Scsi_Host {
 	/* The controller does not support WRITE SAME */
 	unsigned no_write_same:1;
 
+	/* Inline encryption support? */
+	unsigned inlinecrypt_support:1;
+
 	unsigned use_blk_mq:1;
 	unsigned use_cmd_list:1;
 
 	/* Host responded with short (<36 bytes) INQUIRY result */
 	unsigned short_inquiry:1;
+
+	/*
+	 * Set "DBD" field in mode_sense caching mode page in case it is
+	 * mandatory by LLD standard.
+	 */
+	unsigned set_dbd_for_caching:1;
 
 	/*
 	 * Optional work queue to be utilized by the transport
@@ -701,6 +710,9 @@ struct Scsi_Host {
 	 * Needed just in case we have virtual hosts.
 	 */
 	struct device *dma_dev;
+#ifdef CONFIG_USB_STORAGE_DETECT
+	unsigned int  by_usb;
+#endif
 
 	/*
 	 * We should ensure that this is aligned, both for better performance

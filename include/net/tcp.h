@@ -148,6 +148,9 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
 						 * most likely due to retrans in 3WHS.
 						 */
 
+/* Number of full MSS to receive before Acking RFC2581 */
+#define TCP_DELACK_SEG          1
+
 #define TCP_RESOURCE_PROBE_INTERVAL ((unsigned)(HZ/2U)) /* Maximal interval between probes
 					                 * for local resources.
 					                 */
@@ -251,6 +254,11 @@ extern long sysctl_tcp_mem[3];
 #define TCP_RACK_NO_DUPTHRESH    0x4 /* Do not use DUPACK threshold in RACK */
 
 extern atomic_long_t tcp_memory_allocated;
+
+/* sysctl variables for controlling various tcp parameters */
+extern int sysctl_tcp_delack_seg;
+extern int sysctl_tcp_use_userconfig;
+
 extern struct percpu_counter tcp_sockets_allocated;
 extern unsigned long tcp_memory_pressure;
 
@@ -344,6 +352,14 @@ void tcp_twsk_destructor(struct sock *sk);
 ssize_t tcp_splice_read(struct socket *sk, loff_t *ppos,
 			struct pipe_inode_info *pipe, size_t len,
 			unsigned int flags);
+
+/* sysctl master controller */
+extern int tcp_use_userconfig_sysctl_handler(struct ctl_table *table,
+				int write, void __user *buffer, size_t *length,
+				loff_t *ppos);
+extern int tcp_proc_delayed_ack_control(struct ctl_table *table, int write,
+				void __user *buffer, size_t *length,
+				loff_t *ppos);
 
 void tcp_enter_quickack_mode(struct sock *sk, unsigned int max_quickacks);
 static inline void tcp_dec_quickack_mode(struct sock *sk,
@@ -485,15 +501,16 @@ static inline void tcp_synq_overflow(const struct sock *sk)
 		reuse = rcu_dereference(sk->sk_reuseport_cb);
 		if (likely(reuse)) {
 			last_overflow = READ_ONCE(reuse->synq_overflow_ts);
-			if (time_after32(now, last_overflow + HZ))
+			if (!time_between32(now, last_overflow,
+					    last_overflow + HZ))
 				WRITE_ONCE(reuse->synq_overflow_ts, now);
 			return;
 		}
 	}
 
-	last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
-	if (time_after32(now, last_overflow + HZ))
-		tcp_sk(sk)->rx_opt.ts_recent_stamp = now;
+	last_overflow = READ_ONCE(tcp_sk(sk)->rx_opt.ts_recent_stamp);
+	if (!time_between32(now, last_overflow, last_overflow + HZ))
+		WRITE_ONCE(tcp_sk(sk)->rx_opt.ts_recent_stamp, now);
 }
 
 /* syncookies: no recent synqueue overflow on this listening socket? */
@@ -508,13 +525,23 @@ static inline bool tcp_synq_no_recent_overflow(const struct sock *sk)
 		reuse = rcu_dereference(sk->sk_reuseport_cb);
 		if (likely(reuse)) {
 			last_overflow = READ_ONCE(reuse->synq_overflow_ts);
-			return time_after32(now, last_overflow +
-					    TCP_SYNCOOKIE_VALID);
+			return !time_between32(now, last_overflow - HZ,
+					       last_overflow +
+					       TCP_SYNCOOKIE_VALID);
 		}
 	}
 
-	last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
-	return time_after32(now, last_overflow + TCP_SYNCOOKIE_VALID);
+	last_overflow = READ_ONCE(tcp_sk(sk)->rx_opt.ts_recent_stamp);
+
+	/* If last_overflow <= jiffies <= last_overflow + TCP_SYNCOOKIE_VALID,
+	 * then we're under synflood. However, we have to use
+	 * 'last_overflow - HZ' as lower bound. That's because a concurrent
+	 * tcp_synq_overflow() could update .ts_recent_stamp after we read
+	 * jiffies but before we store .ts_recent_stamp into last_overflow,
+	 * which could lead to rejecting a valid syncookie.
+	 */
+	return !time_between32(now, last_overflow - HZ,
+			       last_overflow + TCP_SYNCOOKIE_VALID);
 }
 
 static inline u32 tcp_cookie_time(void)
@@ -1318,7 +1345,7 @@ static inline void tcp_sack_reset(struct tcp_options_received *rx_opt)
 	rx_opt->num_sacks = 0;
 }
 
-u32 tcp_default_init_rwnd(u32 mss);
+u32 tcp_default_init_rwnd(const struct sock *sk, u32 mss);
 void tcp_cwnd_restart(struct sock *sk, s32 delta);
 
 static inline void tcp_slow_start_after_idle_check(struct sock *sk)
@@ -1353,7 +1380,7 @@ static inline int tcp_win_from_space(const struct sock *sk, int space)
 /* Note: caller must be prepared to deal with negative returns */
 static inline int tcp_space(const struct sock *sk)
 {
-	return tcp_win_from_space(sk, sk->sk_rcvbuf -
+	return tcp_win_from_space(sk, sk->sk_rcvbuf - sk->sk_backlog.len -
 				  atomic_read(&sk->sk_rmem_alloc));
 }
 

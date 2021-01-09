@@ -19,6 +19,9 @@ config GCC_VERSION
 config CC_IS_CLANG
 	def_bool $(success,$(CC) --version | head -n 1 | grep -q clang)
 
+config LD_IS_LLD
+	def_bool $(success,$(LD) -v | head -n 1 | grep -q LLD)
+
 config CLANG_VERSION
 	int
 	default $(shell,$(srctree)/scripts/clang-version.sh $(CC))
@@ -329,15 +332,20 @@ config AUDIT
 	help
 	  Enable auditing infrastructure that can be used with another
 	  kernel subsystem, such as SELinux (which requires this for
-	  logging of avc messages output).  System call auditing is included
-	  on architectures which support it.
+	  logging of avc messages output). Does not do system-call
+	  auditing without CONFIG_AUDITSYSCALL.
 
 config HAVE_ARCH_AUDITSYSCALL
 	bool
 
 config AUDITSYSCALL
-	def_bool y
+	bool "Enable system-call auditing support"
 	depends on AUDIT && HAVE_ARCH_AUDITSYSCALL
+	default y if SECURITY_SELINUX
+	help
+	  Enable low-overhead system-call auditing infrastructure that
+	  can be used independently or with another kernel subsystem,
+	  such as SELinux.
 
 config AUDIT_WATCH
 	def_bool y
@@ -418,6 +426,15 @@ config IRQ_TIME_ACCOUNTING
 
 	  If in doubt, say N here.
 
+config SCHED_WALT
+	bool "Support window based load tracking"
+	depends on SMP
+	help
+	This feature will allow the scheduler to maintain a tunable window
+	based set of metrics for tasks and runqueues. These metrics can be
+	used to guide task placement as well as task frequency requirements
+	for cpufreq governors.
+
 config HAVE_SCHED_AVG_IRQ
 	def_bool y
 	depends on IRQ_TIME_ACCOUNTING || PARAVIRT_TIME_ACCOUNTING
@@ -493,6 +510,55 @@ config TASK_IO_ACCOUNTING
 
 	  Say N if unsure.
 
+config PSI
+	bool "Pressure stall information tracking"
+	help
+	  Collect metrics that indicate how overcommitted the CPU, memory,
+	  and IO capacity are in the system.
+
+	  If you say Y here, the kernel will create /proc/pressure/ with the
+	  pressure statistics files cpu, memory, and io. These will indicate
+	  the share of walltime in which some or all tasks in the system are
+	  delayed due to contention of the respective resource.
+
+	  In kernels with cgroup support, cgroups (cgroup2 only) will
+	  have cpu.pressure, memory.pressure, and io.pressure files,
+	  which aggregate pressure stalls for the grouped tasks only.
+
+	  For more details see Documentation/accounting/psi.txt.
+
+	  Say N if unsure.
+
+config PSI_DEFAULT_DISABLED
+	bool "Require boot parameter to enable pressure stall information tracking"
+	default n
+	depends on PSI
+	help
+	  If set, pressure stall information tracking will be disabled
+	  per default but can be enabled through passing psi=1 on the
+	  kernel commandline during boot.
+
+	  This feature adds some code to the task wakeup and sleep
+	  paths of the scheduler. The overhead is too low to affect
+	  common scheduling-intense workloads in practice (such as
+	  webservers, memcache), but it does show up in artificial
+	  scheduler stress tests, such as hackbench.
+
+	  If you are paranoid and not sure what the kernel will be
+	  used for, say Y.
+
+	  Say N if unsure.
+
+config PSI_FTRACE
+	bool "Insert debug hooks for PSI ftrace events"
+	default n
+	depends on PSI
+	help
+	  If not set, PSI ftrace events will be disabled and
+	  will not incur any performance penalty.
+	  If set, PSI ftrace events may be
+	  enabled.
+
 endmenu # "CPU/Task time and stats accounting"
 
 config CPU_ISOLATION
@@ -533,6 +599,15 @@ config IKCONFIG_PROC
 	  This option enables access to the kernel configuration file
 	  through /proc/config.gz.
 
+config IKHEADERS
+	tristate "Enable kernel headers through /sys/kernel/kheaders.tar.xz"
+	depends on SYSFS
+	help
+	  This option enables access to the in-kernel headers that are generated during
+	  the build process. These can be used to build eBPF tracing programs,
+	  or similar programs.  If you build the headers as a module, a module called
+	  kheaders.ko is built which can be loaded on-demand to get access to headers.
+
 config LOG_BUF_SHIFT
 	int "Kernel log buffer size (16 => 64KB, 17 => 128KB)"
 	range 12 25
@@ -551,6 +626,16 @@ config LOG_BUF_SHIFT
 		     14 => 16 KB
 		     13 =>  8 KB
 		     12 =>  4 KB
+
+config CONSOLE_FLUSH_ON_HOTPLUG
+	bool "Enable console flush configurable in hot plug code path"
+	depends on HOTPLUG_CPU
+	def_bool n
+	help
+	In cpu hot plug path console lock acquire and release causes the
+	console to flush. If console lock is not free hot plug latency
+	increases. So make console flush configurable in hot plug path
+	and default disabled to help in cpu hot plug latencies.
 
 config LOG_CPU_MAX_BUF_SHIFT
 	int "CPU kernel log buffer size contribution (13 => 8 KB, 17 => 128KB)"
@@ -691,6 +776,7 @@ config PAGE_COUNTER
 
 config MEMCG
 	bool "Memory controller"
+	default y
 	select PAGE_COUNTER
 	select EVENTFD
 	help
@@ -699,6 +785,7 @@ config MEMCG
 config MEMCG_SWAP
 	bool "Swap controller"
 	depends on MEMCG && SWAP
+	default y
 	help
 	  Provides control over the swap space consumed by tasks in a cgroup.
 
@@ -715,6 +802,11 @@ config MEMCG_SWAP_ENABLED
 	  For those who want to have the feature enabled by default should
 	  select this option (if, for some reason, they need to disable it
 	  then swapaccount=0 does the trick).
+
+config MEMCG_FORCE_USE_VM_SWAPPINESS
+	bool "Force to use vm_swappiness instead of memcg->swappiness"
+	depends on MEMCG_SWAP
+	default y
 
 config MEMCG_KMEM
 	bool
@@ -916,6 +1008,16 @@ config SOCK_CGROUP_DATA
 
 endif # CGROUPS
 
+config SCHED_CORE_CTL
+	bool "QTI Core Control"
+	depends on SMP && SCHED_WALT
+	help
+	  This options enables the core control functionality in
+	  the scheduler. Core control automatically offline and
+	  online cores based on cpu load and utilization.
+
+	  If unsure, say N here.
+
 menuconfig NAMESPACES
 	bool "Namespaces support" if EXPERT
 	depends on MULTIUSER
@@ -998,6 +1100,29 @@ config SCHED_AUTOGROUP
 	  of workloads isolates aggressive CPU burners (like build jobs) from
 	  desktop applications.  Task group autogeneration is currently based
 	  upon task session.
+
+config SCHED_TUNE
+	bool "Boosting for CFS tasks (EXPERIMENTAL)"
+	depends on SMP
+	help
+	  This option enables support for task classification using a new
+	  cgroup controller, schedtune. Schedtune allows tasks to be given
+	  a boost value and marked as latency-sensitive or not. This option
+	  provides the "schedtune" controller.
+
+	  This new controller:
+	  1. allows only a two layers hierarchy, where the root defines the
+	     system-wide boost value and its direct childrens define each one a
+	     different "class of tasks" to be boosted with a different value
+	  2. supports up to 16 different task classes, each one which could be
+	     configured with a different boost value
+
+	  Latency-sensitive tasks are not subject to energy-aware wakeup
+	  task placement. The boost value assigned to tasks is used to
+	  influence task placement and CPU frequency selection (if
+	  utilization-driven frequency selection is in use).
+
+	  If unsure, say N.
 
 config SYSFS_DEPRECATED
 	bool "Enable deprecated sysfs features to support old userspace tools"
@@ -1569,6 +1694,16 @@ config PERF_EVENTS
 
 	  Say Y if unsure.
 
+config PERF_USER_SHARE
+	bool "Perf event sharing with user-space"
+	help
+	  Say yes here to enable the user-space sharing of events. The events
+	  can be shared among other user-space events or with kernel created
+	  events that has the same config and type event attributes.
+
+	  Say N if unsure.
+
+
 config DEBUG_PERF_USE_VMALLOC
 	default n
 	bool "Debug: use vmalloc to back perf mmap() buffers"
@@ -1981,7 +2116,7 @@ endif # MODULES
 
 config MODULES_TREE_LOOKUP
 	def_bool y
-	depends on PERF_EVENTS || TRACING
+	depends on PERF_EVENTS || TRACING || CFI_CLANG
 
 config INIT_ALL_POSSIBLE
 	bool

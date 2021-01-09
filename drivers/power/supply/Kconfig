@@ -645,4 +645,9 @@ config CHARGER_CROS_USBPD
 	  what is connected to USB PD ports from the EC and converts
 	  that into power_supply properties.
 
+#/* Bug 538062, zhangbin2.wt, 20200309, Add for AFC */
+source "drivers/power/supply/afc/Kconfig"
+
+source "drivers/power/supply/qcom/Kconfig"
+
 endif # POWER_SUPPLY

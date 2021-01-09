@@ -15,7 +15,11 @@
 #include <linux/seq_file.h>
 #include <linux/debugfs.h>
 #include <linux/pm_wakeirq.h>
+#include <linux/types.h>
 #include <trace/events/power.h>
+#include <linux/irq.h>
+#include <linux/interrupt.h>
+#include <linux/irqdesc.h>
 
 #include "power.h"
 
@@ -809,6 +813,37 @@ void pm_wakeup_dev_event(struct device *dev, unsigned int msec, bool hard)
 }
 EXPORT_SYMBOL_GPL(pm_wakeup_dev_event);
 
+void pm_get_active_wakeup_sources(char *pending_wakeup_source, size_t max)
+{
+	struct wakeup_source *ws, *last_active_ws = NULL;
+	int len = 0;
+	bool active = false;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
+		if (ws->active && len < max) {
+			if (!active)
+				len += scnprintf(pending_wakeup_source, max,
+						"Pending Wakeup Sources: ");
+			len += scnprintf(pending_wakeup_source + len, max - len,
+				"%s ", ws->name);
+			active = true;
+		} else if (!active &&
+			   (!last_active_ws ||
+			    ktime_to_ns(ws->last_time) >
+			    ktime_to_ns(last_active_ws->last_time))) {
+			last_active_ws = ws;
+		}
+	}
+	if (!active && last_active_ws) {
+		scnprintf(pending_wakeup_source, max,
+				"Last active Wakeup Source: %s",
+				last_active_ws->name);
+	}
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_GPL(pm_get_active_wakeup_sources);
+
 void pm_print_active_wakeup_sources(void)
 {
 	struct wakeup_source *ws;
@@ -818,7 +853,9 @@ void pm_print_active_wakeup_sources(void)
 	srcuidx = srcu_read_lock(&wakeup_srcu);
 	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
 		if (ws->active) {
-			pr_debug("active wakeup source: %s\n", ws->name);
+			//+Bug 537413,jiangyanjun.wt,MODIFY,20200306,add important power debug log
+			pr_info("active wakeup source: %s\n", ws->name);
+			//-Bug 537413,jiangyanjun.wt,MODIFY,20200306,add important power debug log
 			active = 1;
 		} else if (!active &&
 			   (!last_activity_ws ||
@@ -829,8 +866,10 @@ void pm_print_active_wakeup_sources(void)
 	}
 
 	if (!active && last_activity_ws)
-		pr_debug("last active wakeup source: %s\n",
+		//+Bug 537413,jiangyanjun.wt,MODIFY,20200306,add important power debug log
+		pr_info("last active wakeup source: %s\n",
 			last_activity_ws->name);
+		//-Bug 537413,jiangyanjun.wt,MODIFY,20200306,add important power debug log
 	srcu_read_unlock(&wakeup_srcu, srcuidx);
 }
 EXPORT_SYMBOL_GPL(pm_print_active_wakeup_sources);
@@ -887,7 +926,21 @@ void pm_wakeup_clear(bool reset)
 
 void pm_system_irq_wakeup(unsigned int irq_number)
 {
+	struct irq_desc *desc;
+	const char *name = "null";
+
 	if (pm_wakeup_irq == 0) {
+		if (msm_show_resume_irq_mask) {
+			desc = irq_to_desc(irq_number);
+			if (desc == NULL)
+				name = "stray irq";
+			else if (desc->action && desc->action->name)
+				name = desc->action->name;
+
+			pr_warn("%s: %d triggered %s\n", __func__,
+					irq_number, name);
+
+		}
 		pm_wakeup_irq = irq_number;
 		pm_system_wakeup();
 	}

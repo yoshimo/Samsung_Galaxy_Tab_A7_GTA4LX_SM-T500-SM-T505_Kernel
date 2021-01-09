@@ -26,6 +26,10 @@
 #include "fsmap.h"
 #include <trace/events/ext4.h>
 
+#ifdef CONFIG_FSCRYPT_SDP
+#include <linux/fscrypto_sdp_ioctl.h>
+#endif
+
 /**
  * Swap memory between @a and @b for @len bytes.
  *
@@ -132,6 +136,7 @@ static long swap_inode_boot_loader(struct super_block *sb,
 
 	if (inode->i_nlink != 1 || !S_ISREG(inode->i_mode) ||
 	    IS_SWAPFILE(inode) || IS_ENCRYPTED(inode) ||
+	    (EXT4_I(inode)->i_flags & EXT4_JOURNAL_DATA_FL) ||
 	    ext4_has_inline_data(inode)) {
 		err = -EINVAL;
 		goto journal_err_out;
@@ -256,7 +261,7 @@ journal_err_out:
 	return err;
 }
 
-#ifdef CONFIG_EXT4_FS_ENCRYPTION
+#ifdef CONFIG_FS_ENCRYPTION
 static int uuid_is_zero(__u8 u[16])
 {
 	int	i;
@@ -1072,7 +1077,7 @@ resizefs_out:
 		return fscrypt_ioctl_set_policy(filp, (const void __user *)arg);
 
 	case EXT4_IOC_GET_ENCRYPTION_PWSALT: {
-#ifdef CONFIG_EXT4_FS_ENCRYPTION
+#ifdef CONFIG_FS_ENCRYPTION
 		int err, err2;
 		struct ext4_sb_info *sbi = EXT4_SB(sb);
 		handle_t *handle;
@@ -1175,6 +1180,18 @@ out:
 	}
 	case EXT4_IOC_SHUTDOWN:
 		return ext4_shutdown(sb, arg);
+
+#ifdef CONFIG_FSCRYPT_SDP
+	case FS_IOC_GET_SDP_INFO:
+	case FS_IOC_SET_SDP_POLICY:
+	case FS_IOC_SET_SENSITIVE:
+	case FS_IOC_SET_PROTECTED:
+	case FS_IOC_ADD_CHAMBER:
+	case FS_IOC_REMOVE_CHAMBER:
+	case FS_IOC_DUMP_FILE_KEY:
+		return fscrypt_sdp_ioctl(filp, cmd, arg);
+#endif
+
 	default:
 		return -ENOTTY;
 	}
@@ -1237,6 +1254,15 @@ long ext4_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case EXT4_IOC_GET_ENCRYPTION_POLICY:
 	case EXT4_IOC_SHUTDOWN:
 	case FS_IOC_GETFSMAP:
+#ifdef CONFIG_FSCRYPT_SDP
+	case FS_IOC_GET_SDP_INFO:
+	case FS_IOC_SET_SDP_POLICY:
+	case FS_IOC_SET_SENSITIVE:
+	case FS_IOC_SET_PROTECTED:
+	case FS_IOC_ADD_CHAMBER:
+	case FS_IOC_REMOVE_CHAMBER:
+	case FS_IOC_DUMP_FILE_KEY:
+#endif
 		break;
 	default:
 		return -ENOIOCTLCMD;

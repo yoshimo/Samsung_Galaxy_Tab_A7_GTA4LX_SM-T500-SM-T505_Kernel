@@ -154,7 +154,7 @@ static int compute_score(struct sock *sk, struct net *net,
 			score++;
 	}
 
-	if (sk->sk_incoming_cpu == raw_smp_processor_id())
+	if (READ_ONCE(sk->sk_incoming_cpu) == raw_smp_processor_id())
 		score++;
 
 	return score;
@@ -426,6 +426,9 @@ try_again:
 						(struct sockaddr *)sin6);
 	}
 
+	if (udp_sk(sk)->gro_enabled)
+		udp_cmsg_recv(msg, sk, skb);
+
 	if (np->rxopt.all)
 		ip6_datagram_recv_common_ctl(sk, msg, skb);
 
@@ -556,11 +559,11 @@ static __inline__ void udpv6_err(struct sk_buff *skb,
 static DEFINE_STATIC_KEY_FALSE(udpv6_encap_needed_key);
 void udpv6_encap_enable(void)
 {
-	static_branch_enable(&udpv6_encap_needed_key);
+	static_branch_inc(&udpv6_encap_needed_key);
 }
 EXPORT_SYMBOL(udpv6_encap_enable);
 
-static int udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
+static int udpv6_queue_rcv_one_skb(struct sock *sk, struct sk_buff *skb)
 {
 	struct udp_sock *up = udp_sk(sk);
 	int is_udplite = IS_UDPLITE(sk);
@@ -641,6 +644,28 @@ drop:
 	atomic_inc(&sk->sk_drops);
 	kfree_skb(skb);
 	return -1;
+}
+
+static int udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
+{
+	struct sk_buff *next, *segs;
+	int ret;
+
+	if (likely(!udp_unexpected_gso(sk, skb)))
+		return udpv6_queue_rcv_one_skb(sk, skb);
+
+	__skb_push(skb, -skb_mac_offset(skb));
+	segs = udp_rcv_segment(sk, skb, false);
+	for (skb = segs; skb; skb = next) {
+		next = skb->next;
+		__skb_pull(skb, skb_transport_offset(skb));
+
+		ret = udpv6_queue_rcv_one_skb(sk, skb);
+		if (ret > 0)
+			ip6_protocol_deliver_rcu(dev_net(skb->dev), skb, ret,
+						 true);
+	}
+	return 0;
 }
 
 static bool __udp_v6_is_mcast_sock(struct net *net, struct sock *sk,
@@ -1476,11 +1501,15 @@ void udpv6_destroy_sock(struct sock *sk)
 	udp_v6_flush_pending_frames(sk);
 	release_sock(sk);
 
-	if (static_branch_unlikely(&udpv6_encap_needed_key) && up->encap_type) {
-		void (*encap_destroy)(struct sock *sk);
-		encap_destroy = READ_ONCE(up->encap_destroy);
-		if (encap_destroy)
-			encap_destroy(sk);
+	if (static_branch_unlikely(&udpv6_encap_needed_key)) {
+		if (up->encap_type) {
+			void (*encap_destroy)(struct sock *sk);
+			encap_destroy = READ_ONCE(up->encap_destroy);
+			if (encap_destroy)
+				encap_destroy(sk);
+		}
+		if (up->encap_enabled)
+			static_branch_dec(&udpv6_encap_needed_key);
 	}
 
 	inet6_destroy_sock(sk);

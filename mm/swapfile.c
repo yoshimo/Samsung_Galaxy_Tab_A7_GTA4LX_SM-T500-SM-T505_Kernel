@@ -85,8 +85,8 @@ PLIST_HEAD(swap_active_head);
  * is held and the locking order requires swap_lock to be taken
  * before any swap_info_struct->lock.
  */
-static struct plist_head *swap_avail_heads;
-static DEFINE_SPINLOCK(swap_avail_lock);
+struct plist_head *swap_avail_heads;
+DEFINE_SPINLOCK(swap_avail_lock);
 
 struct swap_info_struct *swap_info[MAX_SWAPFILES];
 
@@ -956,6 +956,7 @@ int get_swap_pages(int n_goal, swp_entry_t swp_entries[], int entry_size)
 	long avail_pgs;
 	int n_ret = 0;
 	int node;
+	int swap_ratio_off = 0;
 
 	/* Only single cluster request supported */
 	WARN_ON_ONCE(n_goal > 1 && size == SWAPFILE_CLUSTER);
@@ -972,14 +973,34 @@ int get_swap_pages(int n_goal, swp_entry_t swp_entries[], int entry_size)
 
 	atomic_long_sub(n_goal * size, &nr_swap_pages);
 
+lock_and_start:
 	spin_lock(&swap_avail_lock);
 
 start_over:
 	node = numa_node_id();
 	plist_for_each_entry_safe(si, next, &swap_avail_heads[node], avail_lists[node]) {
+
+		if (sysctl_swap_ratio && !swap_ratio_off) {
+			int ret;
+
+			spin_unlock(&swap_avail_lock);
+			ret = swap_ratio(&si, node);
+			if (ret < 0) {
+				/*
+				 * Error. Start again with swap
+				 * ratio disabled.
+				 */
+				swap_ratio_off = 1;
+				goto lock_and_start;
+			} else {
+				goto start;
+			}
+		}
+
 		/* requeue si to after same-priority siblings */
 		plist_requeue(&si->avail_lists[node], &swap_avail_heads[node]);
 		spin_unlock(&swap_avail_lock);
+start:
 		spin_lock(&si->lock);
 		if (!si->highest_bit || !(si->flags & SWP_WRITEOK)) {
 			spin_lock(&swap_avail_lock);
@@ -3279,9 +3300,11 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 
 	mutex_lock(&swapon_mutex);
 	prio = -1;
-	if (swap_flags & SWAP_FLAG_PREFER)
+	if (swap_flags & SWAP_FLAG_PREFER) {
 		prio =
 		  (swap_flags & SWAP_FLAG_PRIO_MASK) >> SWAP_FLAG_PRIO_SHIFT;
+		setup_swap_ratio(p, prio);
+	}
 	enable_swap_info(p, prio, swap_map, cluster_info, frontswap_map);
 
 	pr_info("Adding %uk swap on %s.  Priority:%d extents:%d across:%lluk %s%s%s%s%s\n",
@@ -3768,6 +3791,55 @@ void mem_cgroup_throttle_swaprate(struct mem_cgroup *memcg, int node,
 }
 #endif
 
+unsigned long get_swap_orig_data_nrpages(void)
+{
+	unsigned long x = 0;
+#if IS_ENABLED(CONFIG_ZSMALLOC)
+	struct sysinfo i;
+
+	si_swapinfo(&i);
+	x = i.totalswap - i.freeswap;
+#endif
+	/*
+	 * to be safe on arithmetic calcuation in case of either
+	 * !defined(CONFIG_ZSMALLOC) or entirely swap free
+	 */
+	if (x == 0)
+		x = 1;
+
+	return x;
+}
+
+unsigned long get_swap_comp_pool_nrpages(void)
+{
+	unsigned long x = 0;
+
+#if IS_ENABLED(CONFIG_ZSMALLOC)
+	x = global_zone_page_state(NR_ZSPAGES);
+#endif
+
+	return x;
+}
+
+static int swap_size_notifier(struct notifier_block *nb,
+			       unsigned long action, void *data)
+{
+	struct seq_file *s;
+
+	s = (struct seq_file *)data;
+	if (s)
+		seq_printf(s, "SwapSize:       %8lu kB\n",
+			(unsigned long)get_swap_comp_pool_nrpages() << (PAGE_SHIFT - 10));
+	else
+		pr_cont("SwapSize:%lukB ",
+			(unsigned long)get_swap_comp_pool_nrpages() << (PAGE_SHIFT - 10));
+	return 0;
+}
+
+static struct notifier_block swap_size_nb = {
+	.notifier_call = swap_size_notifier,
+};
+
 static int __init swapfile_init(void)
 {
 	int nid;
@@ -3781,6 +3853,8 @@ static int __init swapfile_init(void)
 
 	for_each_node(nid)
 		plist_head_init(&swap_avail_heads[nid]);
+
+	show_mem_extra_notifier_register(&swap_size_nb);
 
 	return 0;
 }

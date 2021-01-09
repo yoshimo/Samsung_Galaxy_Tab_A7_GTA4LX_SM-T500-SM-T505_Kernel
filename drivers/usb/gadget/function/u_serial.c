@@ -568,7 +568,7 @@ static int gs_start_io(struct gs_port *port)
 	started = gs_start_rx(port);
 
 	/* unblock any pending writes into our circular buffer */
-	if (started) {
+	if (started && port->port.tty != NULL) {
 		tty_wakeup(port->port.tty);
 	} else {
 		gs_free_requests(ep, head, &port->read_allocated);
@@ -706,6 +706,8 @@ static void gs_close(struct tty_struct *tty, struct file *file)
 	struct gs_port *port = tty->driver_data;
 	struct gserial	*gser;
 
+	if (port == NULL)
+		return;
 	spin_lock_irq(&port->port_lock);
 
 	if (port->port.count != 1) {
@@ -1246,8 +1248,10 @@ int gserial_alloc_line(unsigned char *line_num)
 				__func__, port_num, PTR_ERR(tty_dev));
 
 		ret = PTR_ERR(tty_dev);
+		mutex_lock(&ports[port_num].lock);
 		port = ports[port_num].port;
 		ports[port_num].port = NULL;
+		mutex_unlock(&ports[port_num].lock);
 		gserial_free_port(port);
 		goto err;
 	}

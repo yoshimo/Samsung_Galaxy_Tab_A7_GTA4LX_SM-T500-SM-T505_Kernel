@@ -110,6 +110,9 @@ source "drivers/usb/image/Kconfig"
 
 source "drivers/usb/usbip/Kconfig"
 
+#bug545925, zhaobeilong@wt, 20200410, add usb control node
+source "drivers/usb/notify/Kconfig"
+
 endif
 
 source "drivers/usb/mtu3/Kconfig"
@@ -172,6 +175,8 @@ source "drivers/usb/gadget/Kconfig"
 source "drivers/usb/typec/Kconfig"
 
 source "drivers/usb/roles/Kconfig"
+
+source "drivers/usb/pd/Kconfig"
 
 config USB_LED_TRIG
 	bool "USB LED Triggers"

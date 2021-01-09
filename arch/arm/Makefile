@@ -10,6 +10,10 @@
 #
 # Copyright (C) 1995-2001 by Russell King
 
+ifeq ($(CONFIG_BUILD_ARM64_DT_OVERLAY),y)
+export DTC_FLAGS := -@
+endif
+
 LDFLAGS_vmlinux	:=-p --no-undefined -X --pic-veneer
 ifeq ($(CONFIG_CPU_ENDIAN_BE8),y)
 LDFLAGS_vmlinux	+= --be8
@@ -26,6 +30,10 @@ GZFLAGS		:=-9
 # Never generate .eh_frame
 KBUILD_CFLAGS	+= $(call cc-option,-fno-dwarf2-cfi-asm)
 
+ifeq ($(cc-name),clang)
+KBUILD_CFLAGS += -Wno-vectorizer-no-neon
+endif
+
 # This should work on most of the modern platforms
 KBUILD_DEFCONFIG := multi_v7_defconfig
 
@@ -36,7 +44,7 @@ KBUILD_CFLAGS	+= $(call cc-option,-mno-unaligned-access)
 endif
 
 ifeq ($(CONFIG_FRAME_POINTER),y)
-KBUILD_CFLAGS	+=-fno-omit-frame-pointer -mapcs -mno-sched-prolog
+KBUILD_CFLAGS  +=-fno-omit-frame-pointer $(call cc-option,-mapcs,) $(call cc-option,-mno-sched-prolog,)
 endif
 
 ifeq ($(CONFIG_CPU_BIG_ENDIAN),y)
@@ -303,6 +311,8 @@ libs-y				:= arch/arm/lib/ $(libs-y)
 boot := arch/arm/boot
 ifeq ($(CONFIG_XIP_KERNEL),y)
 KBUILD_IMAGE := $(boot)/xipImage
+else ifeq ($(CONFIG_BUILD_ARM_APPENDED_DTB_IMAGE),y)
+KBUILD_IMAGE := $(boot)/zImage-dtb
 else
 KBUILD_IMAGE := $(boot)/zImage
 endif
@@ -311,6 +321,8 @@ endif
 ifeq ($(CONFIG_USE_OF),y)
 KBUILD_DTBS := dtbs
 endif
+
+DTSSUBDIR       := vendor/qcom
 
 all:	$(notdir $(KBUILD_IMAGE)) $(KBUILD_DTBS)
 
@@ -346,6 +358,7 @@ PHONY += dtbs dtbs_install
 
 dtbs: prepare scripts
 	$(Q)$(MAKE) $(build)=$(boot)/dts
+	$(foreach DIR, $(DTSSUBDIR), $(Q)$(MAKE) $(build)=$(boot)/dts/$(DIR) MACHINE=$(MACHINE) dtbs)
 
 dtbs_install:
 	$(Q)$(MAKE) $(dtbinst)=$(boot)/dts
@@ -355,6 +368,12 @@ vdso_install:
 ifeq ($(CONFIG_VDSO),y)
 	$(Q)$(MAKE) $(build)=arch/arm/vdso $@
 endif
+
+zImage-dtb: vmlinux scripts dtbs
+	$(Q)$(MAKE) $(build)=$(boot) MACHINE=$(MACHINE) DTSSUBDIR=$(DTSSUBDIR) $(boot)/$@
+
+Image-dtb: vmlinux scripts dtbs
+	$(Q)$(MAKE) $(build)=$(boot) MACHINE=$(MACHINE) DTSSUBDIR=$(DTSSUBDIR) $(boot)/$@
 
 # We use MRPROPER_FILES and CLEAN_FILES now
 archclean:

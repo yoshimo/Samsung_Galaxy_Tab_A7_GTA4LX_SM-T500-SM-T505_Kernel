@@ -19,6 +19,7 @@
 
 #include <linux/cpu.h>
 #include <linux/cpufreq.h>
+#include <linux/cpufreq_times.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/init.h>
@@ -29,6 +30,9 @@
 #include <linux/suspend.h>
 #include <linux/syscore_ops.h>
 #include <linux/tick.h>
+#include <linux/sched/topology.h>
+#include <linux/sched/sysctl.h>
+
 #include <trace/events/power.h>
 
 static LIST_HEAD(cpufreq_policy_list);
@@ -157,6 +161,12 @@ __weak void arch_set_freq_scale(struct cpumask *cpus, unsigned long cur_freq,
 {
 }
 EXPORT_SYMBOL_GPL(arch_set_freq_scale);
+
+__weak void arch_set_max_freq_scale(struct cpumask *cpus,
+				    unsigned long policy_max_freq)
+{
+}
+EXPORT_SYMBOL_GPL(arch_set_max_freq_scale);
 
 /*
  * This is a generic cpufreq init() routine which can be used by cpufreq
@@ -349,6 +359,7 @@ static void cpufreq_notify_transition(struct cpufreq_policy *policy,
 		}
 
 		cpufreq_stats_record_transition(policy, freqs->new);
+		cpufreq_times_record_transition(policy, freqs->new);
 		policy->cur = freqs->new;
 	}
 }
@@ -648,10 +659,34 @@ static ssize_t show_##file_name				\
 }
 
 show_one(cpuinfo_min_freq, cpuinfo.min_freq);
-show_one(cpuinfo_max_freq, cpuinfo.max_freq);
 show_one(cpuinfo_transition_latency, cpuinfo.transition_latency);
 show_one(scaling_min_freq, min);
 show_one(scaling_max_freq, max);
+
+unsigned int cpuinfo_max_freq_cached;
+
+static bool should_use_cached_freq(int cpu)
+{
+	if (!cpuinfo_max_freq_cached)
+		return false;
+
+	if (!(BIT(cpu) & sched_lib_mask_force))
+		return false;
+
+	return is_sched_lib_based_app(current->pid);
+}
+
+static ssize_t show_cpuinfo_max_freq(struct cpufreq_policy *policy, char *buf)
+{
+	unsigned int freq = policy->cpuinfo.max_freq;
+
+	if (should_use_cached_freq(policy->cpu))
+		freq = cpuinfo_max_freq_cached << 1;
+	else
+		freq = policy->cpuinfo.max_freq;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", freq);
+}
 
 __weak unsigned int arch_freq_get_on_cpu(int cpu)
 {
@@ -909,6 +944,9 @@ static ssize_t show(struct kobject *kobj, struct attribute *attr, char *buf)
 	struct freq_attr *fattr = to_attr(attr);
 	ssize_t ret;
 
+	if (!fattr->show)
+		return -EIO;
+
 	down_read(&policy->rwsem);
 	ret = fattr->show(policy, buf);
 	up_read(&policy->rwsem);
@@ -922,6 +960,9 @@ static ssize_t store(struct kobject *kobj, struct attribute *attr,
 	struct cpufreq_policy *policy = to_policy(kobj);
 	struct freq_attr *fattr = to_attr(attr);
 	ssize_t ret = -EINVAL;
+
+	if (!fattr->store)
+		return -EIO;
 
 	/*
 	 * cpus_read_trylock() is used here to work around a circular lock
@@ -1066,7 +1107,8 @@ static int cpufreq_add_policy_cpu(struct cpufreq_policy *policy, unsigned int cp
 	if (has_target()) {
 		ret = cpufreq_start_governor(policy);
 		if (ret)
-			pr_err("%s: Failed to start governor\n", __func__);
+			pr_err("%s: Failed to start governor for CPU%u, policy CPU%u\n",
+			       __func__, cpu, policy->cpu);
 	}
 	up_write(&policy->rwsem);
 	return ret;
@@ -1296,6 +1338,7 @@ static int cpufreq_online(unsigned int cpu)
 			goto out_destroy_policy;
 
 		cpufreq_stats_create_table(policy);
+		cpufreq_times_create_policy(policy);
 
 		write_lock_irqsave(&cpufreq_driver_lock, flags);
 		list_add(&policy->policy_list, &cpufreq_policy_list);
@@ -1858,9 +1901,17 @@ EXPORT_SYMBOL(cpufreq_unregister_notifier);
 unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
 					unsigned int target_freq)
 {
+	int ret;
+
 	target_freq = clamp_val(target_freq, policy->min, policy->max);
 
-	return cpufreq_driver->fast_switch(policy, target_freq);
+	ret = cpufreq_driver->fast_switch(policy, target_freq);
+	if (ret) {
+		cpufreq_times_record_transition(policy, ret);
+		cpufreq_stats_record_transition(policy, ret);
+	}
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(cpufreq_driver_fast_switch);
 
@@ -1962,15 +2013,6 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
 
 	pr_debug("target for CPU %u: %u kHz, relation %u, requested %u kHz\n",
 		 policy->cpu, target_freq, relation, old_target_freq);
-
-	/*
-	 * This might look like a redundant call as we are checking it again
-	 * after finding index. But it is left intentionally for cases where
-	 * exactly same freq is called again and so we can save on few function
-	 * calls.
-	 */
-	if (target_freq == policy->cur)
-		return 0;
 
 	/* Save last value to restore later on errors */
 	policy->restore_freq = policy->cur;
@@ -2224,6 +2266,10 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
 			CPUFREQ_ADJUST, new_policy);
 
+	/* adjust if necessary - hardware incompatibility */
+	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
+			CPUFREQ_INCOMPATIBLE, new_policy);
+
 	/*
 	 * verify the cpu speed can be set within this limit, which might be
 	 * different to the first one
@@ -2239,6 +2285,8 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 	policy->min = new_policy->min;
 	policy->max = new_policy->max;
 	trace_cpu_frequency_limits(policy);
+
+	arch_set_max_freq_scale(policy->cpus, policy->max);
 
 	policy->cached_target_freq = UINT_MAX;
 
@@ -2474,6 +2522,13 @@ int cpufreq_register_driver(struct cpufreq_driver *driver_data)
 	if (cpufreq_disabled())
 		return -ENODEV;
 
+	/*
+	 * The cpufreq core depends heavily on the availability of device
+	 * structure, make sure they are available before proceeding further.
+	 */
+	if (!get_cpu_device(0))
+		return -EPROBE_DEFER;
+
 	if (!driver_data || !driver_data->verify || !driver_data->init ||
 	    !(driver_data->setpolicy || driver_data->target_index ||
 		    driver_data->target) ||
@@ -2527,7 +2582,7 @@ int cpufreq_register_driver(struct cpufreq_driver *driver_data)
 	hp_online = ret;
 	ret = 0;
 
-	pr_debug("driver %s up and running\n", driver_data->name);
+	pr_info("driver %s up and running\n", driver_data->name);
 	goto out;
 
 err_if_unreg:
@@ -2559,7 +2614,7 @@ int cpufreq_unregister_driver(struct cpufreq_driver *driver)
 	if (!cpufreq_driver || (driver != cpufreq_driver))
 		return -EINVAL;
 
-	pr_debug("unregistering driver %s\n", driver->name);
+	pr_info("unregistering driver %s\n", driver->name);
 
 	/* Protect against concurrent cpu hotplug */
 	cpus_read_lock();
